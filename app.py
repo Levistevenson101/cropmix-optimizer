@@ -1,22 +1,31 @@
 import streamlit as st
-from ortools.linear_solver import pywraplp
+import numpy as np
+from scipy.optimize import linprog
 
-st.set_page_config(page_title="CropMix Optimizer", page_icon="🌾", layout="centered")
+st.set_page_config(page_title="AgriLign — Crop Mix Optimizer", page_icon="🌾", layout="centered")
 
-st.title("🌾 CropMix Optimizer — Online")
-st.caption("Linear program with efficacy constraint. Runs on free hosts (Streamlit Cloud / Render) without external solvers.")
+st.title("🌾 AgriLign — Crop Mix Optimizer (Corn vs Soy)")
+st.caption("Linear program solved with SciPy (no external solvers).")
 
 with st.expander("Model", expanded=False):
     st.markdown(
         """
-        Decision variables: **Corn acres (C)** and **Soy acres (S)**.  
-        Objective: Maximize `profit_corn*C + profit_soy*S`.  
-        Constraints: land, labor, herbicide $, nitrogen, and **linear efficacy** `eff_corn*C + eff_soy*S ≥ target*(C+S)`.
+**Decision variables**: Corn acres (C), Soy acres (S)
+
+**Objective**: Maximize profit = `p_c*C + p_s*S`
+
+**Constraints**:
+- Land: `C + S = Total` (or `≤ Total` if idle allowed)
+- Labor: `a_c*C + a_s*S ≤ cap`
+- Herbicide budget: `h_c*C + h_s*S ≤ cap`
+- Nitrogen: `n_c*C + n_s*S ≤ cap`
+- **Efficacy (linear)**: `e_c*C + e_s*S ≥ target*(C+S)` → rearranged to ` (e_c-target)*C + (e_s-target)*S ≥ 0`
         """
     )
 
-# ---------- Inputs ----------
+# ---------- Sidebar inputs ----------
 st.sidebar.header("Inputs")
+
 total_acres = st.sidebar.number_input("Total acres", min_value=0.0, value=1000.0, step=10.0)
 
 profit_corn = st.sidebar.number_input("Profit/acre — Corn ($)", value=350.0, step=10.0)
@@ -35,81 +44,70 @@ labor_cap   = st.sidebar.number_input("Labor cap (hr)", min_value=0.0, value=200
 herb_cap    = st.sidebar.number_input("Herbicide budget ($)", min_value=0.0, value=30000.0, step=100.0)
 N_cap       = st.sidebar.number_input("Nitrogen cap (lb)", min_value=0.0, value=90000.0, step=100.0)
 
+eff_corn    = st.sidebar.number_input("Efficacy — Corn", min_value=0.0, max_value=1.0, value=0.90, step=0.01, format="%.2f")
+eff_soy     = st.sidebar.number_input("Efficacy — Soy",  min_value=0.0, max_value=1.0, value=0.87, step=0.01, format="%.2f")
 target      = st.sidebar.number_input("Minimum efficacy target", min_value=0.0, max_value=1.0, value=0.88, step=0.01, format="%.2f")
+
 idle_ok     = st.sidebar.checkbox("Allow idle land (≤ total acres)", value=False)
 
-def solve():
-    # Use OR-Tools GLOP (LP) for maximum cloud compatibility
-    solver = pywraplp.Solver.CreateSolver("GLOP")
-    if solver is None:
-        return {"status": "ERROR", "msg": "Could not create OR-Tools solver."}
+# ---------- Build LP for SciPy ----------
+# Maximize p·x  <=>  Minimize -p·x
+c = np.array([-profit_corn, -profit_soy])  # objective coefficients (negated)
 
-    C = solver.NumVar(0.0, solver.infinity(), "Corn")
-    S = solver.NumVar(0.0, solver.infinity(), "Soy")
+A_ub = []
+b_ub = []
 
-    # Objective
-    solver.Maximize(profit_corn*C + profit_soy*S)
+# Resource caps: a_c*C + a_s*S ≤ cap
+A_ub.append([labor_corn, labor_soy]);   b_ub.append(labor_cap)
+A_ub.append([herb_corn,  herb_soy]);    b_ub.append(herb_cap)
+A_ub.append([N_corn,     N_soy]);       b_ub.append(N_cap)
 
-    # Constraints
-    if idle_ok:
-        solver.Add(C + S <= total_acres)
+# Linear efficacy: (e_c - target)*C + (e_s - target)*S ≥ 0  -> multiply by -1 to fit ≤
+A_ub.append([-(eff_corn - target), -(eff_soy - target)]); b_ub.append(0.0)
+
+A_ub = np.array(A_ub)
+b_ub = np.array(b_ub)
+
+A_eq = None
+b_eq = None
+if idle_ok:
+    # C + S ≤ total_acres
+    A_ub = np.vstack([A_ub, [1.0, 1.0]])
+    b_ub = np.append(b_ub, total_acres)
+else:
+    # C + S = total_acres
+    A_eq = np.array([[1.0, 1.0]])
+    b_eq = np.array([total_acres])
+
+bounds = [(0, None), (0, None)]  # C ≥ 0, S ≥ 0
+
+# ---------- Solve ----------
+if st.button("🔎 Solve", type="primary"):
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method="highs")
+
+    if not res.success:
+        st.error(f"Solver failed: {res.message}")
+        st.info("Try: allow idle land, lower the efficacy target, or relax a cap.")
     else:
-        solver.Add(C + S == total_acres)
+        C, S = res.x
+        total_profit = -res.fun  # we minimized -profit
 
-    solver.Add(labor_corn*C + labor_soy*S <= labor_cap)
-    solver.Add(herb_corn*C  + herb_soy*S  <= herb_cap)
-    solver.Add(N_corn*C     + N_soy*S     <= N_cap)
-    solver.Add((0.0 + 1.0*0)*C >= 0)  # no-op to ensure variables used
+        labor_used = labor_corn*C + labor_soy*S
+        herb_used  = herb_corn*C  + herb_soy*S
+        N_used     = N_corn*C     + N_soy*S
+        eff_LHS    = eff_corn*C + eff_soy*S
+        eff_RHS    = target*(C+S)
 
-    # Linear efficacy: eff_corn*C + eff_soy*S >= target*(C + S)
-    solver.Add((st.session_state.get("eff_corn", 0.90) if True else 0.90)*C + 
-               (st.session_state.get("eff_soy", 0.87) if True else 0.87)*S >= target*(C + S))
-
-    status = solver.Solve()
-    if status != pywraplp.Solver.OPTIMAL:
-        return {"status": "INFEASIBLE_OR_ERROR", "msg": "No optimal solution. Try relaxing caps, lowering target, or allowing idle land."}
-
-    Cval = C.solution_value()
-    Sval = S.solution_value()
-    profit = solver.Objective().Value()
-    used = {
-        "Land": Cval + Sval,
-        "Labor": labor_corn*Cval + labor_soy*Sval,
-        "Herbicide": herb_corn*Cval + herb_soy*Sval,
-        "Nitrogen": N_corn*Cval + N_soy*Sval,
-        "Efficacy_LHS": (st.session_state.get("eff_corn", 0.90))*Cval + (st.session_state.get("eff_soy", 0.87))*Sval,
-        "Efficacy_RHS": target*(Cval + Sval),
-    }
-    return {"status": "OPTIMAL", "corn": Cval, "soy": Sval, "profit": profit, "used": used}
-
-st.session_state.setdefault("eff_corn", 0.90)
-st.session_state.setdefault("eff_soy", 0.87)
-
-with st.form("solveform"):
-    col1, col2 = st.columns(2)
-    with col1:
-        st.number_input("Efficacy — Corn", min_value=0.0, max_value=1.0, value=st.session_state["eff_corn"], step=0.01, format="%.2f", key="eff_corn")
-    with col2:
-        st.number_input("Efficacy — Soy", min_value=0.0, max_value=1.0, value=st.session_state["eff_soy"], step=0.01, format="%.2f", key="eff_soy")
-    submitted = st.form_submit_button("🔎 Solve")
-
-if submitted:
-    out = solve()
-    if out["status"] != "OPTIMAL":
-        st.error(out.get("msg", "Solve failed."))
-    else:
         c1, c2, c3 = st.columns(3)
-        c1.metric("Corn acres", f"{out['corn']:.2f}")
-        c2.metric("Soy acres", f"{out['soy']:.2f}")
-        c3.metric("Max profit", f"${out['profit']:,.2f}")
+        c1.metric("Corn acres", f"{C:.2f}")
+        c2.metric("Soy acres",  f"{S:.2f}")
+        c3.metric("Max profit", f"${total_profit:,.2f}")
 
         st.markdown("#### Constraint usage")
         st.table({
             "Constraint": ["Land", "Labor", "Herbicide", "Nitrogen", "Efficacy LHS", "Efficacy RHS"],
-            "Used": [f"{out['used']['Land']:.2f}",
-                     f"{out['used']['Labor']:.2f}",
-                     f"{out['used']['Herbicide']:.2f}",
-                     f"{out['used']['Nitrogen']:.2f}",
-                     f"{out['used']['Efficacy_LHS']:.2f}",
-                     f"{out['used']['Efficacy_RHS']:.2f}"]
+            "Used": [f"{(C+S):.2f}", f"{labor_used:.2f}", f"{herb_used:.2f}", f"{N_used:.2f}", f"{eff_LHS:.2f}", f"{eff_RHS:.2f}"],
+            "Cap / Target": [f"{total_acres:.2f}", f"{labor_cap:.2f}", f"{herb_cap:.2f}", f"{N_cap:.2f}", "—", "—"]
         })
+else:
+    st.info("Set inputs in the sidebar, then click **Solve**.")
